@@ -56,8 +56,11 @@ jobs:
             SONAR_CONTEXT_TYPE="pullRequest"
             SONAR_CONTEXT_VALUE="${{ github.event.pull_request.number }}"
           else
-            SONAR_CONTEXT_TYPE="branch"
-            SONAR_CONTEXT_VALUE="${NOMBRE_RAMA}"
+            # En SonarQube Cloud Free la rama principal se consulta sin
+            # enviar el parámetro branch. Esto evita que "main" sea
+            # interpretada como una rama secundaria.
+            SONAR_CONTEXT_TYPE="main"
+            SONAR_CONTEXT_VALUE=""
           fi
 
           echo "SONAR_PROJECT_KEY=${SONAR_PROJECT_KEY}" >> "${GITHUB_ENV}"
@@ -177,6 +180,58 @@ jobs:
             echo "Código HTTP: ${CODIGO_HTTP}"
             cat proyecto-sonar.json || true
             exit 1
+          fi
+
+      # Verificar el nombre de la rama principal registrada en Sonar.
+      # Los proyectos creados por API pueden quedar inicialmente con "master".
+      # Para Banco Exterior se busca mantener "main" como rama principal.
+      - name: Validar rama principal del proyecto en Sonar
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsS \
+            --get \
+            "${SONAR_HOST_URL}/api/project_branches/list" \
+            --header "Authorization: Bearer ${SONAR_TOKEN}" \
+            --header "Accept: application/json" \
+            --data-urlencode "project=${SONAR_PROJECT_KEY}" \
+            --output ramas-proyecto-sonar.json
+
+          RAMA_PRINCIPAL_SONAR="$(
+            jq -r '
+              [.branches[]? | select(.isMain == true) | .name][0] // empty
+            ' ramas-proyecto-sonar.json
+          )"
+
+          echo "Rama principal registrada en Sonar: ${RAMA_PRINCIPAL_SONAR:-No disponible}"
+
+          if [ -n "${RAMA_PRINCIPAL_SONAR}" ] && [ "${RAMA_PRINCIPAL_SONAR}" != "main" ]; then
+            echo "La rama principal de Sonar no coincide con la rama principal de GitHub."
+            echo "Intentando renombrarla a main..."
+
+            CODIGO_RENOMBRE="$(
+              curl -sS \
+                --request POST \
+                "${SONAR_HOST_URL}/api/project_branches/rename" \
+                --header "Authorization: Bearer ${SONAR_TOKEN}" \
+                --header "Content-Type: application/x-www-form-urlencoded" \
+                --header "Accept: application/json" \
+                --data-urlencode "project=${SONAR_PROJECT_KEY}" \
+                --data-urlencode "name=main" \
+                --output renombre-rama-sonar.json \
+                --write-out "%{http_code}"
+            )"
+
+            if [ "${CODIGO_RENOMBRE}" -ge 200 ] && [ "${CODIGO_RENOMBRE}" -lt 300 ]; then
+              echo "Rama principal de Sonar renombrada a main."
+            else
+              echo "No fue posible renombrar automáticamente la rama principal."
+              echo "Código HTTP: ${CODIGO_RENOMBRE}"
+              cat renombre-rama-sonar.json || true
+              echo
+              echo "El flujo continuará. Para consultas de la rama principal no se enviará el parámetro branch."
+            fi
           fi
 
       # Generar la configuración del scanner dinámicamente.
@@ -342,8 +397,10 @@ jobs:
                   "analyses": analysis_id,
                   "ps": page_size,
                   "p": page,
-                  context_type: context_value,
               }
+
+              if context_type == "pullRequest" and context_value:
+                  params["pullRequest"] = context_value
 
               url = (
                   f"{host}/api/issues/search?"
@@ -427,16 +484,28 @@ jobs:
 
           METRICAS="new_violations,new_accepted_issues,new_coverage,new_lines_to_cover,new_uncovered_lines,new_duplicated_lines_density,new_duplicated_lines,new_lines,new_security_hotspots,alert_status,quality_gate_details"
 
-          curl -fsS \
-            --get \
-            "${SONAR_HOST_URL}/api/measures/component" \
-            --header "Authorization: Bearer ${SONAR_TOKEN}" \
-            --header "Accept: application/json" \
-            --data-urlencode "organization=${SONAR_ORGANIZATION}" \
-            --data-urlencode "component=${SONAR_PROJECT_KEY}" \
-            --data-urlencode "${SONAR_CONTEXT_TYPE}=${SONAR_CONTEXT_VALUE}" \
-            --data-urlencode "metricKeys=${METRICAS}" \
-            --output metricas-sonar.json
+          if [ "${SONAR_CONTEXT_TYPE}" = "pullRequest" ]; then
+            curl -fsS \
+              --get \
+              "${SONAR_HOST_URL}/api/measures/component" \
+              --header "Authorization: Bearer ${SONAR_TOKEN}" \
+              --header "Accept: application/json" \
+              --data-urlencode "organization=${SONAR_ORGANIZATION}" \
+              --data-urlencode "component=${SONAR_PROJECT_KEY}" \
+              --data-urlencode "pullRequest=${SONAR_CONTEXT_VALUE}" \
+              --data-urlencode "metricKeys=${METRICAS}" \
+              --output metricas-sonar.json
+          else
+            curl -fsS \
+              --get \
+              "${SONAR_HOST_URL}/api/measures/component" \
+              --header "Authorization: Bearer ${SONAR_TOKEN}" \
+              --header "Accept: application/json" \
+              --data-urlencode "organization=${SONAR_ORGANIZATION}" \
+              --data-urlencode "component=${SONAR_PROJECT_KEY}" \
+              --data-urlencode "metricKeys=${METRICAS}" \
+              --output metricas-sonar.json
+          fi
 
           QUALITY_GATE="$(
             jq -r '
@@ -477,6 +546,8 @@ jobs:
             organizacion-sonar.json
             proyecto-sonar.json
             creacion-proyecto-sonar.json
+            ramas-proyecto-sonar.json
+            renombre-rama-sonar.json
             tarea-procesamiento-sonar.txt
             tarea-sonar.json
             analisis-proyecto-sonar.json
