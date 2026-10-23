@@ -534,6 +534,301 @@ jobs:
             | "\(.metric): \(.value // "N/D")"
           ' metricas-sonar.json
 
+      # Normalizar los resultados de Sonar al contrato de datos de Banco Exterior.
+      - name: Normalizar resultados para Port
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          def cargar(ruta):
+              with open(ruta, "r", encoding="utf-8") as archivo:
+                  return json.load(archivo)
+
+          hallazgos_doc = cargar("hallazgos-sonar.json")
+          metricas_doc = cargar("metricas-sonar.json")
+          analisis_doc = cargar("analisis-proyecto-sonar.json")
+
+          analysis_id = os.environ["SONAR_ANALYSIS_ID"]
+          project_key = os.environ["SONAR_PROJECT_KEY"]
+          repo = os.environ["GITHUB_REPOSITORY"].split("/")[-1]
+          branch = os.environ["SONAR_BRANCH"]
+
+          def valor_metrica(nombre, defecto=0):
+              medidas = metricas_doc.get("component", {}).get("measures", [])
+              medida = next((m for m in medidas if m.get("metric") == nombre), None)
+              if not medida:
+                  return defecto
+
+              valor = medida.get("value")
+              if valor is None and isinstance(medida.get("period"), dict):
+                  valor = medida["period"].get("value")
+              if valor is None and medida.get("periods"):
+                  valor = medida["periods"][0].get("value")
+
+              if valor in (None, ""):
+                  return defecto
+              return valor
+
+          def numero(nombre, entero=False):
+              valor = valor_metrica(nombre, 0)
+              try:
+                  numero = float(valor)
+                  return int(numero) if entero else numero
+              except (TypeError, ValueError):
+                  return 0
+
+          fecha_analisis = None
+          for elemento in analisis_doc.get("analyses", []):
+              if elemento.get("key") == analysis_id:
+                  fecha_analisis = elemento.get("date")
+                  break
+
+          if not fecha_analisis:
+              fecha_analisis = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+          def calidad(issue):
+              impactos = issue.get("impacts") or []
+              calidades = [i.get("softwareQuality") for i in impactos if i.get("softwareQuality")]
+              valor = calidades[0] if calidades else None
+
+              if valor == "SECURITY":
+                  return "Seguridad"
+              if valor == "RELIABILITY":
+                  return "Fiabilidad"
+              if valor == "MAINTAINABILITY":
+                  return "Mantenibilidad"
+
+              tipo = issue.get("type")
+              if tipo == "VULNERABILITY":
+                  return "Seguridad"
+              if tipo == "BUG":
+                  return "Fiabilidad"
+              if tipo == "CODE_SMELL":
+                  return "Mantenibilidad"
+              return "No disponible"
+
+          def severidad(issue):
+              impactos = issue.get("impacts") or []
+              prioridades = {
+                  "BLOCKER": 5,
+                  "CRITICAL": 4,
+                  "HIGH": 4,
+                  "MAJOR": 3,
+                  "MEDIUM": 3,
+                  "MINOR": 2,
+                  "LOW": 2,
+                  "INFO": 1,
+              }
+
+              candidatos = []
+              if issue.get("severity"):
+                  candidatos.append(issue["severity"])
+
+              for impacto in impactos:
+                  if impacto.get("severity"):
+                      candidatos.append(impacto["severity"])
+
+              if not candidatos:
+                  return "Informativa"
+
+              valor = max(candidatos, key=lambda x: prioridades.get(x, 0))
+
+              if valor == "BLOCKER":
+                  return "Bloqueante"
+              if valor in ("CRITICAL", "HIGH"):
+                  return "Alta"
+              if valor in ("MAJOR", "MEDIUM"):
+                  return "Media"
+              if valor in ("MINOR", "LOW"):
+                  return "Baja"
+              return "Informativa"
+
+          def estado(valor):
+              return {
+                  "OPEN": "Abierto",
+                  "REOPENED": "Abierto",
+                  "CONFIRMED": "Confirmado",
+                  "ACCEPTED": "Aceptado",
+                  "FALSE_POSITIVE": "Falso positivo",
+                  "FALSE-POSITIVE": "Falso positivo",
+                  "FIXED": "Corregido",
+                  "CLOSED": "Corregido",
+                  "RESOLVED": "Corregido",
+              }.get(valor, "Desconocido")
+
+          def tipo_hallazgo(valor):
+              return {
+                  "VULNERABILITY": "Vulnerabilidad",
+                  "BUG": "Error",
+                  "CODE_SMELL": "Problema de mantenibilidad",
+              }.get(valor, "No disponible")
+
+          normalizados = []
+          for issue in hallazgos_doc.get("issues", []):
+              componente = issue.get("component") or ""
+              archivo = componente.split(":", 1)[1] if ":" in componente else componente
+
+              normalizados.append({
+                  "id-hallazgo": issue.get("key") or "hallazgo-sin-id",
+                  "descripcion": issue.get("message") or "Sin descripción disponible",
+                  "calidad-software": calidad(issue),
+                  "severidad": severidad(issue),
+                  "estado": estado(issue.get("status")),
+                  "tipo-hallazgo": tipo_hallazgo(issue.get("type")),
+                  "regla": issue.get("rule") or "No disponible",
+                  "archivo": archivo or "No disponible",
+                  "numero-linea": issue.get("line") or 0,
+                  "esfuerzo-remediacion": issue.get("effort") or issue.get("debt") or "",
+                  "fecha-creacion": issue.get("creationDate") or "2999-01-01T00:00:00Z",
+                  "fecha-actualizacion": issue.get("updateDate") or issue.get("creationDate") or "2999-01-01T00:00:00Z",
+                  "etiquetas": issue.get("tags") or [],
+                  "componente": componente or "No disponible",
+                  "clave-proyecto-sonar": project_key,
+              })
+
+          por_calidad = Counter(h["calidad-software"] for h in normalizados)
+          por_severidad = Counter(h["severidad"] for h in normalizados)
+
+          quality_gate_raw = str(valor_metrica("alert_status", "DESCONOCIDO"))
+          quality_gate = {
+              "OK": "Aprobado",
+              "ERROR": "No aprobado",
+          }.get(quality_gate_raw, "Desconocido")
+
+          analisis_port = {
+              "tipo-evento": "analisis-sonar",
+              "analisis": {
+                  "id-analisis": analysis_id,
+                  "clave-proyecto-sonar": project_key,
+                  "repositorio": repo,
+                  "rama": branch,
+                  "fecha-analisis": fecha_analisis,
+                  "estado-quality-gate": quality_gate,
+                  "metricas": {
+                      "cobertura": numero("new_coverage"),
+                      "lineas-nuevas": numero("new_lines", entero=True),
+                      "lineas-por-cubrir": numero("new_lines_to_cover", entero=True),
+                      "lineas-no-cubiertas": numero("new_uncovered_lines", entero=True),
+                      "densidad-lineas-duplicadas": numero("new_duplicated_lines_density"),
+                      "lineas-duplicadas": numero("new_duplicated_lines", entero=True),
+                      "hallazgos-nuevos": numero("new_violations", entero=True),
+                      "hallazgos-aceptados": numero("new_accepted_issues", entero=True),
+                      "security-hotspots": numero("new_security_hotspots", entero=True),
+                  },
+                  "resumen": {
+                      "hallazgos-seguridad": por_calidad["Seguridad"],
+                      "hallazgos-fiabilidad": por_calidad["Fiabilidad"],
+                      "hallazgos-mantenibilidad": por_calidad["Mantenibilidad"],
+                      "hallazgos-bloqueantes": por_severidad["Bloqueante"],
+                      "hallazgos-altos": por_severidad["Alta"],
+                      "hallazgos-medios": por_severidad["Media"],
+                      "hallazgos-bajos": por_severidad["Baja"],
+                      "hallazgos-informativos": por_severidad["Informativa"],
+                      "total-hallazgos": len(normalizados),
+                  },
+              },
+          }
+
+          with open("analisis-sonar-port.json", "w", encoding="utf-8") as archivo:
+              json.dump(analisis_port, archivo, ensure_ascii=False, indent=2)
+
+          carpeta = Path("hallazgos-sonar-port")
+          carpeta.mkdir(exist_ok=True)
+
+          tamano_lote = 100
+          for indice in range(0, len(normalizados), tamano_lote):
+              lote = normalizados[indice:indice + tamano_lote]
+              numero_lote = (indice // tamano_lote) + 1
+              payload = {
+                  "tipo-evento": "hallazgos-sonar",
+                  "id-analisis": analysis_id,
+                  "clave-proyecto-sonar": project_key,
+                  "hallazgos": lote,
+              }
+              ruta = carpeta / f"hallazgos-sonar-port-{numero_lote:04d}.json"
+              ruta.write_text(
+                  json.dumps(payload, ensure_ascii=False, indent=2),
+                  encoding="utf-8",
+              )
+
+          print(f"Análisis normalizado: {analysis_id}")
+          print(f"Hallazgos normalizados: {len(normalizados)}")
+          print(f"Lotes preparados: {(len(normalizados) + tamano_lote - 1) // tamano_lote}")
+          PY
+
+      # Publicar primero el análisis padre y después todos los lotes de hallazgos.
+      - name: Publicar resultados en Port
+        shell: bash
+        env:
+          PORT_BE_SONAR_WEBHOOK_URL: ${{ secrets.PORT_BE_SONAR_WEBHOOK_URL }}
+          PORT_BE_SONAR_WEBHOOK_SECRET: ${{ secrets.PORT_BE_SONAR_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import hashlib
+          import hmac
+          import os
+          import urllib.error
+          import urllib.request
+          import uuid
+          from pathlib import Path
+
+          url = os.environ["PORT_BE_SONAR_WEBHOOK_URL"]
+          secret = os.environ["PORT_BE_SONAR_WEBHOOK_SECRET"].encode("utf-8")
+
+          if not url or not secret:
+              raise RuntimeError("Faltan los secretos de integración con Port.")
+
+          def enviar(ruta):
+              contenido = Path(ruta).read_bytes()
+              firma = hmac.new(secret, contenido, hashlib.sha256).hexdigest()
+              id_evento = str(uuid.uuid4())
+
+              solicitud = urllib.request.Request(
+                  url,
+                  data=contenido,
+                  method="POST",
+                  headers={
+                      "Content-Type": "application/json",
+                      "x-be-id-evento": id_evento,
+                      "x-be-firma": f"sha256={firma}",
+                  },
+              )
+
+              try:
+                  with urllib.request.urlopen(solicitud, timeout=120) as respuesta:
+                      codigo = respuesta.getcode()
+                      cuerpo = respuesta.read().decode("utf-8", errors="replace")
+              except urllib.error.HTTPError as error:
+                  cuerpo = error.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(
+                      f"Port respondió HTTP {error.code} para {ruta}. Respuesta: {cuerpo}"
+                  ) from error
+
+              if codigo < 200 or codigo >= 300:
+                  raise RuntimeError(
+                      f"Port respondió HTTP {codigo} para {ruta}. Respuesta: {cuerpo}"
+                  )
+
+              print(f"Enviado correctamente a Port: {ruta}")
+
+          enviar("analisis-sonar-port.json")
+
+          lotes = sorted(Path("hallazgos-sonar-port").glob("*.json"))
+          for lote in lotes:
+              enviar(str(lote))
+
+          print(f"Lotes de hallazgos enviados: {len(lotes)}")
+          PY
+
       # Guardar evidencia para la POC y para futuras validaciones con Port.
       - name: Guardar evidencias del análisis
         if: always()
@@ -553,6 +848,8 @@ jobs:
             analisis-proyecto-sonar.json
             hallazgos-sonar.json
             metricas-sonar.json
+            analisis-sonar-port.json
+            hallazgos-sonar-port/
           retention-days: 7
           if-no-files-found: ignore
 
