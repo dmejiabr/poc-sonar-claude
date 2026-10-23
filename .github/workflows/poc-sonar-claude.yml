@@ -204,34 +204,69 @@ jobs:
             ' ramas-proyecto-sonar.json
           )"
 
+          EXISTE_MAIN="$(
+            jq -r '
+              any(.branches[]?; .name == "main")
+            ' ramas-proyecto-sonar.json
+          )"
+
           echo "Rama principal registrada en Sonar: ${RAMA_PRINCIPAL_SONAR:-No disponible}"
+          echo "Existe rama main en Sonar: ${EXISTE_MAIN}"
 
-          if [ -n "${RAMA_PRINCIPAL_SONAR}" ] && [ "${RAMA_PRINCIPAL_SONAR}" != "main" ]; then
-            echo "La rama principal de Sonar no coincide con la rama principal de GitHub."
-            echo "Intentando renombrarla a main..."
+          if [ "${RAMA_PRINCIPAL_SONAR}" = "main" ]; then
+            echo "La rama principal de Sonar ya es main."
 
-            CODIGO_RENOMBRE="$(
+          elif [ "${EXISTE_MAIN}" = "true" ]; then
+            echo "La rama main ya existe, pero no es la principal."
+            echo "Promoviendo main como rama principal..."
+
+            CODIGO_CAMBIO="$(
               curl -sS \
                 --request POST \
-                "${SONAR_HOST_URL}/api/project_branches/rename" \
+                "${SONAR_HOST_URL}/api/project_branches/set_main" \
                 --header "Authorization: Bearer ${SONAR_TOKEN}" \
                 --header "Content-Type: application/x-www-form-urlencoded" \
                 --header "Accept: application/json" \
                 --data-urlencode "project=${SONAR_PROJECT_KEY}" \
-                --data-urlencode "name=main" \
-                --output renombre-rama-sonar.json \
+                --data-urlencode "branch=main" \
+                --output cambio-rama-principal-sonar.json \
                 --write-out "%{http_code}"
             )"
 
-            if [ "${CODIGO_RENOMBRE}" -ge 200 ] && [ "${CODIGO_RENOMBRE}" -lt 300 ]; then
-              echo "Rama principal de Sonar renombrada a main."
+            if [ "${CODIGO_CAMBIO}" -ge 200 ] && [ "${CODIGO_CAMBIO}" -lt 300 ]; then
+              echo "La rama main fue establecida como rama principal de Sonar."
             else
-              echo "No fue posible renombrar automáticamente la rama principal."
-              echo "Código HTTP: ${CODIGO_RENOMBRE}"
-              cat renombre-rama-sonar.json || true
-              echo
-              echo "El flujo continuará. Para consultas de la rama principal no se enviará el parámetro branch."
+              echo "No fue posible establecer main como rama principal."
+              echo "Código HTTP: ${CODIGO_CAMBIO}"
+              cat cambio-rama-principal-sonar.json || true
+              exit 1
             fi
+
+          else
+            echo "La rama main todavía no existe en Sonar."
+            echo "Primero debe existir un análisis de main antes de establecerla como principal."
+            exit 1
+          fi
+
+          curl -fsS \
+            --get \
+            "${SONAR_HOST_URL}/api/project_branches/list" \
+            --header "Authorization: Bearer ${SONAR_TOKEN}" \
+            --header "Accept: application/json" \
+            --data-urlencode "project=${SONAR_PROJECT_KEY}" \
+            --output ramas-proyecto-sonar-despues.json
+
+          RAMA_PRINCIPAL_FINAL="$(
+            jq -r '
+              [.branches[]? | select(.isMain == true) | .name][0] // empty
+            ' ramas-proyecto-sonar-despues.json
+          )"
+
+          echo "Rama principal final en Sonar: ${RAMA_PRINCIPAL_FINAL:-No disponible}"
+
+          if [ "${RAMA_PRINCIPAL_FINAL}" != "main" ]; then
+            echo "La rama principal de Sonar no quedó configurada como main."
+            exit 1
           fi
 
       # Generar la configuración del scanner dinámicamente.
@@ -842,7 +877,8 @@ jobs:
             proyecto-sonar.json
             creacion-proyecto-sonar.json
             ramas-proyecto-sonar.json
-            renombre-rama-sonar.json
+            cambio-rama-principal-sonar.json
+            ramas-proyecto-sonar-despues.json
             tarea-procesamiento-sonar.txt
             tarea-sonar.json
             analisis-proyecto-sonar.json
