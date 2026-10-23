@@ -1,0 +1,503 @@
+name: Análisis de Calidad con Sonar
+
+on:
+  push:
+    branches:
+      - main
+      - feature1
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analisis-sonar:
+    name: Análisis de Calidad con Sonar
+    runs-on: ubuntu-latest
+
+    env:
+      # Configuración de SonarQube Cloud para la POC
+      SONAR_HOST_URL: https://sonarcloud.io
+      SONAR_ORGANIZATION: dmejiabr
+
+      # Token existente en GitHub Actions
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+    steps:
+      # Obtener el código completo para que Sonar disponga del historial Git.
+      - name: Obtener código del repositorio
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # El nombre del repositorio será el identificador base de todo el flujo.
+      # Ejemplo:
+      #   Repositorio GitHub : poc-sonar-claude
+      #   Project Key Sonar  : poc-sonar-claude
+      #   Project Name Sonar : poc-sonar-claude
+      - name: Resolver contexto del análisis
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NOMBRE_REPOSITORIO="${GITHUB_REPOSITORY##*/}"
+          NOMBRE_RAMA="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+
+          SONAR_PROJECT_KEY="${NOMBRE_REPOSITORIO}"
+          SONAR_PROJECT_NAME="${NOMBRE_REPOSITORIO}"
+
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            SONAR_CONTEXT_TYPE="pullRequest"
+            SONAR_CONTEXT_VALUE="${{ github.event.pull_request.number }}"
+          else
+            SONAR_CONTEXT_TYPE="branch"
+            SONAR_CONTEXT_VALUE="${NOMBRE_RAMA}"
+          fi
+
+          echo "SONAR_PROJECT_KEY=${SONAR_PROJECT_KEY}" >> "${GITHUB_ENV}"
+          echo "SONAR_PROJECT_NAME=${SONAR_PROJECT_NAME}" >> "${GITHUB_ENV}"
+          echo "SONAR_BRANCH=${NOMBRE_RAMA}" >> "${GITHUB_ENV}"
+          echo "SONAR_CONTEXT_TYPE=${SONAR_CONTEXT_TYPE}" >> "${GITHUB_ENV}"
+          echo "SONAR_CONTEXT_VALUE=${SONAR_CONTEXT_VALUE}" >> "${GITHUB_ENV}"
+
+          echo "=========================================="
+          echo " CONTEXTO DEL ANÁLISIS SONAR"
+          echo "=========================================="
+          echo "Repositorio       : ${GITHUB_REPOSITORY}"
+          echo "Nombre proyecto   : ${SONAR_PROJECT_NAME}"
+          echo "Clave proyecto    : ${SONAR_PROJECT_KEY}"
+          echo "Organización      : ${SONAR_ORGANIZATION}"
+          echo "Rama              : ${NOMBRE_RAMA}"
+          echo "Commit            : ${GITHUB_SHA}"
+          echo "Evento            : ${GITHUB_EVENT_NAME}"
+          echo "Contexto REST     : ${SONAR_CONTEXT_TYPE}=${SONAR_CONTEXT_VALUE}"
+
+      # Validar el token antes de iniciar cualquier operación.
+      - name: Validar autenticación con Sonar
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsS \
+            --request GET \
+            "${SONAR_HOST_URL}/api/authentication/validate" \
+            --header "Authorization: Bearer ${SONAR_TOKEN}" \
+            --header "Accept: application/json" \
+            --output validacion-token-sonar.json
+
+          if [ "$(jq -r '.valid // false' validacion-token-sonar.json)" != "true" ]; then
+            echo "El token configurado en SONAR_TOKEN no es válido."
+            exit 1
+          fi
+
+          echo "Autenticación con Sonar validada correctamente."
+
+      # Validar la organización, siguiendo el mismo enfoque de la colección de referencia.
+      - name: Validar organización de Sonar
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsS \
+            --get \
+            "${SONAR_HOST_URL}/api/organizations/search" \
+            --header "Authorization: Bearer ${SONAR_TOKEN}" \
+            --header "Accept: application/json" \
+            --data-urlencode "organizations=${SONAR_ORGANIZATION}" \
+            --output organizacion-sonar.json
+
+          if ! jq -e \
+            --arg ORGANIZACION "${SONAR_ORGANIZATION}" \
+            '.organizations[]? | select(.key == $ORGANIZACION)' \
+            organizacion-sonar.json >/dev/null; then
+            echo "No se encontró la organización ${SONAR_ORGANIZATION} en Sonar."
+            exit 1
+          fi
+
+          echo "Organización ${SONAR_ORGANIZATION} validada correctamente."
+
+      # Si el proyecto todavía no existe, se crea automáticamente.
+      # El Project Key y el nombre del proyecto serán iguales al nombre del repositorio.
+      - name: Validar o crear proyecto en Sonar
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CODIGO_HTTP="$(
+            curl -sS \
+              --get \
+              "${SONAR_HOST_URL}/api/components/show" \
+              --header "Authorization: Bearer ${SONAR_TOKEN}" \
+              --header "Accept: application/json" \
+              --data-urlencode "component=${SONAR_PROJECT_KEY}" \
+              --output proyecto-sonar.json \
+              --write-out "%{http_code}"
+          )"
+
+          if [ "${CODIGO_HTTP}" = "200" ]; then
+            echo "El proyecto ${SONAR_PROJECT_KEY} ya existe en Sonar."
+
+          elif [ "${CODIGO_HTTP}" = "404" ]; then
+            echo "El proyecto ${SONAR_PROJECT_KEY} no existe."
+            echo "Creando proyecto en Sonar por primera vez..."
+
+            CODIGO_CREACION="$(
+              curl -sS \
+                --request POST \
+                "${SONAR_HOST_URL}/api/projects/create" \
+                --header "Authorization: Bearer ${SONAR_TOKEN}" \
+                --header "Content-Type: application/x-www-form-urlencoded" \
+                --header "Accept: application/json" \
+                --data-urlencode "organization=${SONAR_ORGANIZATION}" \
+                --data-urlencode "project=${SONAR_PROJECT_KEY}" \
+                --data-urlencode "name=${SONAR_PROJECT_NAME}" \
+                --output creacion-proyecto-sonar.json \
+                --write-out "%{http_code}"
+            )"
+
+            if [ "${CODIGO_CREACION}" -lt 200 ] || [ "${CODIGO_CREACION}" -ge 300 ]; then
+              echo "No fue posible crear el proyecto en Sonar."
+              echo "Código HTTP: ${CODIGO_CREACION}"
+              cat creacion-proyecto-sonar.json || true
+              echo
+              echo "Verifica que SONAR_TOKEN tenga permisos para crear proyectos en la organización."
+              exit 1
+            fi
+
+            echo "Proyecto ${SONAR_PROJECT_KEY} creado correctamente."
+
+          else
+            echo "No fue posible validar el proyecto en Sonar."
+            echo "Código HTTP: ${CODIGO_HTTP}"
+            cat proyecto-sonar.json || true
+            exit 1
+          fi
+
+      # Generar la configuración del scanner dinámicamente.
+      # Esto evita tener que mantener un Project Key fijo dentro del repositorio.
+      - name: Generar configuración del análisis
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > sonar-project.properties <<EOF2
+          sonar.organization=${SONAR_ORGANIZATION}
+          sonar.projectKey=${SONAR_PROJECT_KEY}
+          sonar.projectName=${SONAR_PROJECT_NAME}
+          sonar.sources=.
+          sonar.sourceEncoding=UTF-8
+          sonar.exclusions=.git/**,.github/**,**/node_modules/**,**/vendor/**,**/dist/**,**/build/**,**/.venv/**,**/venv/**
+          sonar.qualitygate.wait=false
+          EOF2
+
+          echo "Configuración generada:"
+          cat sonar-project.properties
+
+      # Ejecutar el análisis oficial de SonarQube Cloud.
+      - name: Ejecutar análisis de Sonar
+        uses: SonarSource/sonarqube-scan-action@v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+
+      # El scanner genera report-task.txt.
+      # Utilizamos su ceTaskId para seguir exactamente el análisis recién enviado.
+      - name: Obtener identificador de procesamiento
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVO_TAREA=".scannerwork/report-task.txt"
+
+          if [ ! -f "${ARCHIVO_TAREA}" ]; then
+            echo "No se encontró ${ARCHIVO_TAREA}."
+            exit 1
+          fi
+
+          cp "${ARCHIVO_TAREA}" tarea-procesamiento-sonar.txt
+
+          CE_TASK_ID="$(
+            grep '^ceTaskId=' "${ARCHIVO_TAREA}" \
+            | cut -d'=' -f2- \
+            | tr -d '\r'
+          )"
+
+          if [ -z "${CE_TASK_ID}" ]; then
+            echo "No fue posible obtener ceTaskId."
+            exit 1
+          fi
+
+          echo "SONAR_CE_TASK_ID=${CE_TASK_ID}" >> "${GITHUB_ENV}"
+          echo "ID de procesamiento Sonar: ${CE_TASK_ID}"
+
+      # Esperar a que Sonar termine de procesar el análisis antes de consultar resultados.
+      - name: Esperar procesamiento del análisis
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COMPLETADO=false
+
+          for INTENTO in $(seq 1 60); do
+            curl -fsS \
+              --get \
+              "${SONAR_HOST_URL}/api/ce/task" \
+              --header "Authorization: Bearer ${SONAR_TOKEN}" \
+              --header "Accept: application/json" \
+              --data-urlencode "id=${SONAR_CE_TASK_ID}" \
+              --output tarea-sonar.json
+
+            ESTADO="$(
+              jq -r '.task.status // empty' tarea-sonar.json
+            )"
+
+            echo "Intento ${INTENTO} - Estado del procesamiento: ${ESTADO}"
+
+            if [ "${ESTADO}" = "SUCCESS" ]; then
+              COMPLETADO=true
+              break
+            fi
+
+            if [ "${ESTADO}" = "FAILED" ] || [ "${ESTADO}" = "CANCELED" ]; then
+              echo "El procesamiento del análisis terminó con estado ${ESTADO}."
+              cat tarea-sonar.json
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          if [ "${COMPLETADO}" != "true" ]; then
+            echo "Se agotó el tiempo esperando el procesamiento de Sonar."
+            exit 1
+          fi
+
+          ANALYSIS_ID="$(
+            jq -r '.task.analysisId // empty' tarea-sonar.json
+          )"
+
+          if [ -z "${ANALYSIS_ID}" ]; then
+            echo "Sonar terminó el procesamiento, pero no devolvió analysisId."
+            cat tarea-sonar.json
+            exit 1
+          fi
+
+          echo "SONAR_ANALYSIS_ID=${ANALYSIS_ID}" >> "${GITHUB_ENV}"
+          echo "ID del análisis Sonar: ${ANALYSIS_ID}"
+
+      # Consultar el histórico de análisis, como en la colección de referencia.
+      - name: Obtener información del análisis
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsS \
+            --get \
+            "${SONAR_HOST_URL}/api/project_analyses/search" \
+            --header "Authorization: Bearer ${SONAR_TOKEN}" \
+            --header "Accept: application/json" \
+            --data-urlencode "organization=${SONAR_ORGANIZATION}" \
+            --data-urlencode "project=${SONAR_PROJECT_KEY}" \
+            --output analisis-proyecto-sonar.json
+
+          echo "Análisis identificado: ${SONAR_ANALYSIS_ID}"
+
+      # Recuperar todos los issues mediante paginación completa.
+      # Se conserva el filtro por proyecto, contexto y analysisId utilizado en la colección.
+      - name: Descargar todos los hallazgos de Sonar
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          host = os.environ["SONAR_HOST_URL"].rstrip("/")
+          token = os.environ["SONAR_TOKEN"]
+          organization = os.environ["SONAR_ORGANIZATION"]
+          project_key = os.environ["SONAR_PROJECT_KEY"]
+          analysis_id = os.environ["SONAR_ANALYSIS_ID"]
+          context_type = os.environ["SONAR_CONTEXT_TYPE"]
+          context_value = os.environ["SONAR_CONTEXT_VALUE"]
+
+          page_size = 500
+          page = 1
+          issues = []
+          total = None
+
+          while total is None or len(issues) < total:
+              params = {
+                  "organization": organization,
+                  "projectKeys": project_key,
+                  "analyses": analysis_id,
+                  "ps": page_size,
+                  "p": page,
+                  context_type: context_value,
+              }
+
+              url = (
+                  f"{host}/api/issues/search?"
+                  + urllib.parse.urlencode(params)
+              )
+
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/json",
+                  },
+              )
+
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  document = json.load(response)
+
+              page_issues = document.get("issues") or []
+              paging = document.get("paging") or {}
+
+              if total is None:
+                  try:
+                      total = int(
+                          paging.get(
+                              "total",
+                              document.get("total", len(page_issues)),
+                          )
+                      )
+                  except Exception:
+                      total = len(page_issues)
+
+                  print(f"Total de hallazgos esperado: {total}")
+
+              issues.extend(page_issues)
+
+              print(
+                  f"Página {page}: "
+                  f"recibidos={len(page_issues)}, "
+                  f"acumulados={len(issues)}"
+              )
+
+              if not page_issues or len(issues) >= total:
+                  break
+
+              page += 1
+
+          if total is None:
+              total = len(issues)
+
+          if len(issues) != total:
+              raise RuntimeError(
+                  "La cantidad de hallazgos descargados "
+                  f"({len(issues)}) no coincide con el total ({total})."
+              )
+
+          output = {
+              "analysisId": analysis_id,
+              "projectKey": project_key,
+              "total": total,
+              "issues": issues,
+          }
+
+          with open("hallazgos-sonar.json", "w", encoding="utf-8") as file:
+              json.dump(output, file, ensure_ascii=False, indent=2)
+
+          print(f"Descarga completa: {len(issues)} hallazgos.")
+          PY
+
+      # Recuperar las mismas métricas principales utilizadas en la colección de referencia.
+      - name: Descargar métricas y Quality Gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          METRICAS="new_violations,new_accepted_issues,new_coverage,new_lines_to_cover,new_uncovered_lines,new_duplicated_lines_density,new_duplicated_lines,new_lines,new_security_hotspots,alert_status,quality_gate_details"
+
+          curl -fsS \
+            --get \
+            "${SONAR_HOST_URL}/api/measures/component" \
+            --header "Authorization: Bearer ${SONAR_TOKEN}" \
+            --header "Accept: application/json" \
+            --data-urlencode "organization=${SONAR_ORGANIZATION}" \
+            --data-urlencode "component=${SONAR_PROJECT_KEY}" \
+            --data-urlencode "${SONAR_CONTEXT_TYPE}=${SONAR_CONTEXT_VALUE}" \
+            --data-urlencode "metricKeys=${METRICAS}" \
+            --output metricas-sonar.json
+
+          QUALITY_GATE="$(
+            jq -r '
+              [
+                .component.measures[]?
+                | select(.metric == "alert_status")
+                | .value
+              ][0] // "DESCONOCIDO"
+            ' metricas-sonar.json
+          )"
+
+          echo "SONAR_QUALITY_GATE=${QUALITY_GATE}" >> "${GITHUB_ENV}"
+
+          echo "=========================================="
+          echo " RESULTADOS DEL ANÁLISIS SONAR"
+          echo "=========================================="
+          echo "Proyecto       : ${SONAR_PROJECT_KEY}"
+          echo "Rama           : ${SONAR_BRANCH}"
+          echo "ID del análisis: ${SONAR_ANALYSIS_ID}"
+          echo "Quality Gate   : ${QUALITY_GATE}"
+          echo "Hallazgos      : $(jq -r '.total // 0' hallazgos-sonar.json)"
+          echo
+          echo "Métricas:"
+          jq -r '
+            .component.measures[]?
+            | "\(.metric): \(.value // "N/D")"
+          ' metricas-sonar.json
+
+      # Guardar evidencia para la POC y para futuras validaciones con Port.
+      - name: Guardar evidencias del análisis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidencias-sonar-${{ github.run_number }}
+          path: |
+            sonar-project.properties
+            validacion-token-sonar.json
+            organizacion-sonar.json
+            proyecto-sonar.json
+            creacion-proyecto-sonar.json
+            tarea-procesamiento-sonar.txt
+            tarea-sonar.json
+            analisis-proyecto-sonar.json
+            hallazgos-sonar.json
+            metricas-sonar.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Igual que en la POC de Checkmarx, el control se aplica al final.
+      # Esto permitirá posteriormente publicar primero los resultados en Port
+      # y después bloquear el pipeline si el Quality Gate falla.
+      - name: Aplicar resultado del Quality Gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          QUALITY_GATE="${SONAR_QUALITY_GATE:-DESCONOCIDO}"
+
+          if [ "${QUALITY_GATE}" = "OK" ]; then
+            echo "El Quality Gate de Sonar fue aprobado."
+            exit 0
+          fi
+
+          if [ "${QUALITY_GATE}" = "ERROR" ]; then
+            echo "El Quality Gate de Sonar no fue aprobado."
+            echo "El análisis y sus evidencias fueron procesados antes de aplicar el fallo."
+            exit 1
+          fi
+
+          echo "No fue posible determinar el estado del Quality Gate."
+          echo "Estado recibido: ${QUALITY_GATE}"
+          exit 1
